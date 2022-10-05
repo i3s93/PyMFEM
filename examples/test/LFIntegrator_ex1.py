@@ -137,6 +137,7 @@ def run(order=1, static_cond=False,
     # Next, loop over the mesh elements and perform certain element-wise operations
     for i in range(mesh.GetNE()):
 
+
         # Get the particular element
         element = fespace.GetFE(i)
         dof = element.GetDof()
@@ -155,9 +156,6 @@ def run(order=1, static_cond=False,
         shape = mfem.Vector(np.zeros([dof]))
         local_vector = mfem.Vector(np.zeros([dof]))
 
-        #print("Dimensions of shape:", shape.GetDataArray().shape, "\n")
-
-
         for j in range(ir.GetNPoints()):
 
             # Get the integration point from the rule
@@ -166,19 +164,19 @@ def run(order=1, static_cond=False,
             # Set an integration point in the element transformation
             Tr.SetIntPoint(ip)
 
-            # Transform the reference points to physical points
+            # Transform the reference integration point to a physical location
             transip = mfem.Vector(np.zeros([3]))
             Tr.Transform(ip, transip)
 
-            # Next, evaluate all the basis functions at physical points
-            #element.CalcPhysShape(Tr, shape)
-            element.CalcShape(ip, shape)
+            # Next, evaluate all the basis functions at this integration point
+            element.CalcPhysShape(Tr, shape)
 
-            # Compute the adjusted quadrature weight
+            # Compute the adjusted quadrature weight (volume factors)
             wt = ip.weight*Tr.Weight()
-            #wt = ip.weight
 
             # Store the contributions of the shape functions in the local vector
+            # No overload for the operator *= with float types, so we cast as a 
+            # Numpy array (shallow copy)
             local_vector += mfem.Vector(wt*shape.GetDataArray())
             
             # Store the relevant quadrature data and shape function data
@@ -205,9 +203,17 @@ def run(order=1, static_cond=False,
 
 
 
+    # Test: Define my own linear form for the RHS based on the above function
+    # This would test if the discrepancies are due to the 'FormLinearSystem' 
+    # method, which performs additional manipulations
+    my_b = mfem.LinearForm(fespace)
+    my_b.AddDomainIntegrator(mfem.DomainLFIntegrator(one))
+    my_b.Assemble()
 
-
-
+    # See if we can overwrite the data in the 'elemvect' attribute
+    # This is essentially the same thing as what our loops above do
+    #my_b.elemvect.Assign(global_vector)
+    #print(my_b.elemvect,"\n") # This won't work b/c this isn't an attribute...
 
     # 7. Define the solution vector x as a finite element grid function
     #   corresponding to fespace. Initialize x with initial guess of zero,
@@ -238,10 +244,34 @@ def run(order=1, static_cond=False,
     a.FormLinearSystem(ess_tdof_list, x, b, A, X, B)
     print("Size of linear system: " + str(A.Height()))
 
+    # Build the linear system with the updated linear form
+    my_B = mfem.Vector()
+    a.FormLinearSystem(ess_tdof_list, x, my_b, A, X, my_B)
 
-    # Compare the output of the two RHS functions
-    print("B =", B.GetDataArray(),"\n")
-    print("global_vector =", global_vector.GetDataArray(),"\n")
+    # Covert the MFEM Vectors to Numpy arrays for norms
+    B_array = B.GetDataArray()
+    my_B_array = my_B.GetDataArray()
+
+    # Compare the output of the two RHS vectors
+    print("B =", B_array,"\n")
+    print("my_B =", my_B_array,"\n")
+
+    # Relative error against the MFEM output in the 2-norm
+    rel_err_1 = np.linalg.norm(global_array - B_array,1)/np.linalg.norm(B_array,1)
+    rel_err_2 = np.linalg.norm(global_array - B_array,2)/np.linalg.norm(B_array,2)
+    rel_err_inf = np.linalg.norm(global_array - B_array,np.inf)/np.linalg.norm(B_array,np.inf)
+
+    print("Relative error in the rhs (1-norm):", rel_err_1, "\n")
+    print("Relative error in the rhs (2-norm):", rel_err_2, "\n")
+    print("Relative error in the rhs (inf-norm):", rel_err_inf, "\n")
+
+
+
+
+
+
+
+
 
     # 10. Solve
     #if pa:

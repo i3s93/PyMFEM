@@ -212,8 +212,7 @@ def run(order=1, static_cond=False,
 
     # See if we can overwrite the data in the 'elemvect' attribute
     # This is essentially the same thing as what our loops above do
-    #my_b.elemvect.Assign(global_vector)
-    #print(my_b.elemvect,"\n") # This won't work b/c this isn't an attribute...
+    my_b.Assign(global_vector)
 
     # 7. Define the solution vector x as a finite element grid function
     #   corresponding to fespace. Initialize x with initial guess of zero,
@@ -257,9 +256,9 @@ def run(order=1, static_cond=False,
     print("my_B =", my_B_array,"\n")
 
     # Relative error against the MFEM output in the 2-norm
-    rel_err_1 = np.linalg.norm(global_array - B_array,1)/np.linalg.norm(B_array,1)
-    rel_err_2 = np.linalg.norm(global_array - B_array,2)/np.linalg.norm(B_array,2)
-    rel_err_inf = np.linalg.norm(global_array - B_array,np.inf)/np.linalg.norm(B_array,np.inf)
+    rel_err_1 = np.linalg.norm(my_B_array - B_array, 1)/np.linalg.norm(B_array, 1)
+    rel_err_2 = np.linalg.norm(my_B_array - B_array, 2)/np.linalg.norm(B_array, 2)
+    rel_err_inf = np.linalg.norm(my_B_array - B_array, np.inf)/np.linalg.norm(B_array, np.inf)
 
     print("Relative error in the rhs (1-norm):", rel_err_1, "\n")
     print("Relative error in the rhs (2-norm):", rel_err_2, "\n")

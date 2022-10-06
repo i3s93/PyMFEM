@@ -62,7 +62,7 @@ class MyDomainLFIntegrator(lininteg.DomainLFIntegrator):
         # Number of active dof on this element
         dof = el.GetDof()
 
-        # Set the maximum order for integration
+        # Set the order for integration
         intorder = 2*el.GetOrder()
 
         # Get the integration rule for this geometry and order

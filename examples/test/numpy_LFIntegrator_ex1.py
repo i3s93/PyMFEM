@@ -114,14 +114,14 @@ def run(order=1, static_cond=False,
 
     # Create an array to hold the global data for the RHS
     # This is basically just the linear form
-    global_vector = mfem.Vector(np.zeros([num_dof]))
+    global_array = np.zeros([num_dof])
 
     #------------------------------------------------------------------------------
     # Test: Storage for the quadrature points and weights on the mesh
     #------------------------------------------------------------------------------
     num_elem = mesh.GetNE()
 
-    # Set the order of the integration rule and number of quadrature points
+    # Set the order of the integration and get the number of quadrature points
     intorder = 2*fespace.GetFE(0).GetOrder()
     num_quad_pts = mfem.IntRules.Get(fespace.GetFE(0).GetGeomType(), intorder).GetNPoints()
 
@@ -144,18 +144,18 @@ def run(order=1, static_cond=False,
         dof = element.GetDof()
 
         # Get the indices for the DoF on this element
-        # This tells us which entries we write to in the global vector
+        # This tells us which entries we write to in the global array
         vdofs = fespace.GetElementVDofs(i)
-        vdofs = mfem.intArray(vdofs)
+        vdofs = np.asarray(vdofs) # Convert the list to a Numpy array
 
         # Get the element's transformation, which will maps the ir's reference points
         Tr = mesh.GetElementTransformation(i)
         ir = mfem.IntRules.Get(element.GetGeomType(), intorder)
 
         # Storage for the basis functions and local dof on this element
-        # This should always be smaller than the size of the global vector
+        # This should always be smaller than the size of the global array
         shape = mfem.Vector(np.zeros([dof]))
-        local_vector = mfem.Vector(np.zeros([dof]))
+        local_array = np.zeros([dof])
 
         for j in range(ir.GetNPoints()):
 
@@ -175,10 +175,8 @@ def run(order=1, static_cond=False,
             # Compute the adjusted quadrature weight (volume factors)
             wt = ip.weight*Tr.Weight()
 
-            # Store the contributions of the shape functions in the local vector
-            # No overload for the operator *= with float types, so we cast as a 
-            # Numpy array (shallow copy)
-            local_vector += mfem.Vector(wt*shape.GetDataArray())
+            # Store the contributions of the shape functions in the local array
+            local_array += wt*shape.GetDataArray()
             
             # Store the relevant quadrature data and shape function data
             # Again, we assume that the number of active dof on each element
@@ -186,36 +184,23 @@ def run(order=1, static_cond=False,
             quad_wts[i,j] = wt
             quad_pts[i,j,:] = transip.GetDataArray()
             shape_at_quad_pts[i,j,:] = shape.GetDataArray()
-
-
-        # Check the updates for the local vector
-        #print("local_vector =", local_vector.GetDataArray(), "\n")
         
-        # Accumulate the local vector and the relevant values of the global vector 
-        global_sub_vector = mfem.Vector()
-        global_vector.GetSubVector(vdofs, global_sub_vector)
-        global_sub_vector += local_vector
+        # Accumulate the local vector and the relevant values of the global vector
+        global_array[vdofs] += local_array[:] # Update the relevant entries of the global array  
 
-        # Set the values in the relevant entries of the global vector
-        global_vector.SetSubVector(vdofs, global_sub_vector)
-    
-        # Check that the values are being set in the global vector
-        #print("global_vector =", global_vector.GetDataArray(), "\n")
-
-
-
-    # Test: Define my own linear form for the RHS based on the above function
-    # This would test if the discrepancies are due to the 'FormLinearSystem' 
-    # method, which performs additional manipulations
+    # Define my own linear form for the RHS based on the above function
+    # The 'FormLinearSystem' method, which performs additional manipulations
+    # that simplify the RHS for the resulting linear system
     my_b = mfem.LinearForm(fespace)
 
-    # Don't use the MFEM assembly commands... use mine instead
+    # Don't use the MFEM assembly commands for the RHS
+    #
     #my_b.AddDomainIntegrator(mfem.DomainLFIntegrator(one))
     #my_b.Assemble()
 
-    # See if we can overwrite the data in the 'elemvect' attribute
+    # Overwrite the data in the 'elemvect' attribute
     # This is essentially the same thing as what our loops above do
-    my_b.Assign(global_vector)
+    my_b.Assign(global_array)
 
     # 7. Define the solution vector x as a finite element grid function
     #   corresponding to fespace. Initialize x with initial guess of zero,
@@ -246,7 +231,7 @@ def run(order=1, static_cond=False,
     a.FormLinearSystem(ess_tdof_list, x, b, A, X, B)
     print("Size of linear system: " + str(A.Height()))
 
-    # Build the linear system with the updated linear form
+    # Build the linear system with my linear form
     my_B = mfem.Vector()
     a.FormLinearSystem(ess_tdof_list, x, my_b, A, X, my_B)
 

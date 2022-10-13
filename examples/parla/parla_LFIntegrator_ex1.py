@@ -81,15 +81,17 @@ def run(order=1, static_cond=False,
     else:
         order = 1
         fec = mfem.H1_FECollection(order, dim)
+
     fespace = mfem.FiniteElementSpace(mesh, fec)
     print('Number of finite element unknowns: ' +
-          str(fespace.GetTrueVSize()))
+          str(fespace.GetTrueVSize()),"\n")
 
     # 5. Determine the list of true (i.e. conforming) essential boundary dofs.
     #    In this example, the boundary conditions are defined by marking all
     #    the boundary attributes from the mesh as essential (Dirichlet) and
     #    converting them to a list of true dofs.
     ess_tdof_list = mfem.intArray()
+
     if mesh.bdr_attributes.Size() > 0:
         ess_bdr = mfem.intArray([1] * mesh.bdr_attributes.Max())
         ess_bdr = mfem.intArray(mesh.bdr_attributes.Max())
@@ -108,28 +110,9 @@ def run(order=1, static_cond=False,
     # Version based on Parla (naive approach)
     #-----------------------------------------------------------------------------
 
-    # Create the task space first
-    ts = TaskSpace('LFTaskSpace')
-
     # Create a dictionary for MFEM objects to expand their scope
     # This will gradually get larger as we'll add objects to it
-    pymfem_obj = {"dim": dim, "order": order, "mesh": mesh}
-    
-    # First, get the integration rules based on the order and geometry
-    # This will fill a list with various rules based on the different element
-    # geometries, in which a particular element geometry can be accessed.
-    int_rules = [mfem.IntRules.Get(i, 2*order) for i in range(mfem.Geometry.NumGeom)]
-    
-    # Set the number of DoF according to the FE space
-    num_dof = fespace.GetNDofs()
-    
-    # Create an array to hold the global data for the RHS
-    # This is basically just the linear form
-    global_array = np.zeros([num_dof])
-    
-    # Add entries to the dictionary
-    pymfem_obj["fespace"] = fespace
-    pymfem_obj["int_rules"] = int_rules
+    #pymfem_obj = {"dim": dim, "order": order, "fespace": fespace}
     
     # Specify a partition of the (global) list of elements
     num_blocks = 4 # How many blocks do you want to use?! 
@@ -140,11 +123,17 @@ def run(order=1, static_cond=False,
     block_sizes = elements_per_block*np.ones([num_blocks], dtype=np.int64)
     block_sizes[0:leftover_blocks] += 1
     
-    print("Information about the blocks:")
-    print(" Number of blocks:" + "{:d}".format(num_blocks), "\n",
-    "Number of left-over blocks:" + "{:d}".format(leftover_blocks), "\n",
-    "Elements per block:", block_sizes,"\n")
-    
+    print("Number of blocks: " + str(num_blocks))
+    print("Number of left-over blocks: " + str(leftover_blocks))
+    print("Elements per block:", block_sizes,"\n")
+
+    # Set the number of DoF according to the FE space
+    num_dof = fespace.GetNDofs()
+  
+    # Create an array to hold the global data for the RHS
+    # This is just the linear form
+    global_array = np.zeros([num_dof])
+
     # To use the blocking scheme, we'll
     # also use another set of arrays that
     # hold partial sums of this global array
@@ -155,30 +144,7 @@ def run(order=1, static_cond=False,
     async def LFIntegration_task():
 
         # Create the task space first
-        ts = TaskSpace('LFTaskSpace')
-
-        # Create a dictionary for MFEM objects to expand their scope
-        # This will gradually get larger as we'll add objects to it
-        pymfem_obj = {"dim": dim, "order": order}
-    
-        # Set the number of DoF according to the FE space
-        num_dof = fespace.GetNDofs()
-    
-        # Create an array to hold the global data for the RHS
-        # This is basically just the linear form
-        global_array = np.zeros([num_dof])
-   
-        # Add any desired entries to the dictionary
-        pymfem_obj["fespace"] = fespace
-
-        # Specify a partition of the (global) list of elements
-        num_blocks = 4 # How many blocks do you want to use?! 
-        elements_per_block = mesh.GetNE()//num_blocks # Block size
-        leftover_blocks = mesh.GetNE() % num_blocks
-
-        # Adjust the number of elements if the block size doesn't divide the elements evenly
-        block_sizes = elements_per_block*np.ones([num_blocks], dtype=np.int64)
-        block_sizes[0:leftover_blocks] += 1
+        ts = TaskSpace("LFTaskSpace")
 
         # To use the blocking scheme, we'll
         # also use another set of arrays that
@@ -195,16 +161,19 @@ def run(order=1, static_cond=False,
             @spawn(taskid=ts[i])
             async def block_local_work():
 
-                # Need the offset for the indices owned by this block
+                # Need the offset for the element indices owned by this block
                 # This is the sum of all block sizes that came before it
                 s_idx = np.sum(block_sizes[:i])
                 e_idx = s_idx + block_sizes[i]
 
-                nonlocal pymfem_obj
-                fespace = pymfem_obj["fespace"]
+                print("i = ", i)
+                print("s_idx = ", s_idx)
 
                 # Next, loop over the mesh elements on this block and perform quadrature evaluations
                 for j in range(s_idx, e_idx):
+
+                    #nonlocal pymfem_obj
+                    #fespace = pymfem_obj["fespace"]
 
                     # Get the particular element
                     element = fespace.GetFE(j)
@@ -246,23 +215,13 @@ def run(order=1, static_cond=False,
                         # Store the contributions of the shape functions in the local array
                         local_array += wt*shape.GetDataArray()
 
-
-
                     # Accumulate the local array into the relevant entries of the block-wise global vector
                     block_global_array[i,vdofs] += local_array[:]
 
+                #print("block_global_array = ", block_global_array, "\n")
 
-
-
-
-        # Barrier for the task space over the blocks
-        await ts
-
-        # Finally, we perform the reduction across the block-wise partial sums as a separate task
-        #@spawn(taskid=ts[num_blocks], dependencies=ts, placement=cpu)
-        #async def reduce_task():
-        #    global_array = np.sum(block_global_array, axis=0)
-        #await ts[num_blocks]
+        # Barrier for the task space associated with the loop over blocks
+        await ts 
 
     global_array = np.sum(block_global_array, axis=0)
 
@@ -299,7 +258,7 @@ def run(order=1, static_cond=False,
     X = mfem.Vector()
 
     a.FormLinearSystem(ess_tdof_list, x, b, A, X, B)
-    print("Size of linear system: " + str(A.Height()))
+    print("Size of linear system: " + str(A.Height()),"\n")
 
     # Build the linear system with my linear form
     my_B = mfem.Vector()
@@ -318,8 +277,8 @@ def run(order=1, static_cond=False,
     rel_err_2 = np.linalg.norm(my_B_array - B_array, 2)/np.linalg.norm(B_array, 2)
     rel_err_inf = np.linalg.norm(my_B_array - B_array, np.inf)/np.linalg.norm(B_array, np.inf)
 
-    print("Relative error in the rhs (1-norm):", rel_err_1, "\n")
-    print("Relative error in the rhs (2-norm):", rel_err_2, "\n")
+    print("Relative error in the rhs (1-norm):", rel_err_1)
+    print("Relative error in the rhs (2-norm):", rel_err_2)
     print("Relative error in the rhs (inf-norm):", rel_err_inf, "\n")
 
 

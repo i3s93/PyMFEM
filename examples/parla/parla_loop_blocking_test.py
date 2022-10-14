@@ -48,7 +48,7 @@ def main():
         for i in range(num_blocks):
 
             @spawn(taskid=ts[i])
-            async def block_local_work():
+            def block_local_work():
 
                 # Need the offset for the element indices owned by this block
                 # This is the sum of all block sizes that came before it
@@ -73,15 +73,14 @@ def main():
 
         await ts
 
-    print("(Before the reduction across blocks) block_global_array[:,:10] = ", block_global_array[:,:10], "\n")
+        print("(Before the reduction across blocks) block_global_array[:,:10] = ", block_global_array[:,:10], "\n")
 
-    # Perform the reduction across the blocks
-    global_array = np.sum(block_global_array, axis=0)
+        # Perform the reduction across the blocks
+        global_array = np.sum(block_global_array, axis=0)
 
-    print("(After reduction across blocks) block_global_array[:,:10] = ", block_global_array[:,:10], "\n")
+        print("(After reduction across blocks) block_global_array[:,:10] = ", block_global_array[:,:10], "\n")
 
-    print("global array[:10] = ", global_array[:10], "\n")
-
+        print("global array[:10] = ", global_array[:10], "\n")
 
 
 if __name__ == "__main__":

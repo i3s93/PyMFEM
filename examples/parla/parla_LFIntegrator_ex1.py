@@ -137,9 +137,7 @@ def run(order=1, static_cond=False,
     # To use the blocking scheme, we'll
     # also use another set of arrays that
     # hold partial sums of this global array
-    #block_global_array = np.zeros([num_blocks, num_dof])
-
-    block_global_array = [ np.zeros([num_dof]) for i in range(num_blocks) ]
+    block_global_array = np.zeros([num_blocks, num_dof])
 
     # Define the main task for parla
     @spawn(placement=cpu)
@@ -155,20 +153,13 @@ def run(order=1, static_cond=False,
         # round-robin style of mapping to devices
         for i in range(num_blocks):
 
-            # Try forcing sequential launching to ensure correctness 
-            deps = [ts[i-1]] if i > 0 else []
-
-            @spawn(taskid=ts[i], dependencies=deps)
+            @spawn(taskid=ts[i])
             def block_local_work():
 
                 # Need the offset for the element indices owned by this block
                 # This is the sum of all block sizes that came before it
                 s_idx = np.sum(block_sizes[:i])
                 e_idx = s_idx + block_sizes[i]
-
-                #print("i=",i,", s_idx=", s_idx, ", e_idx=", e_idx)
-
-                #block_chunk = block_global_array[i]
 
                 # Next, loop over the mesh elements on this block and perform quadrature evaluations
                 for j in range(s_idx, e_idx):
@@ -217,84 +208,75 @@ def run(order=1, static_cond=False,
                         local_array += wt*shape.GetDataArray()
 
                     # Accumulate the local array into the relevant entries of the block-wise global vector
-                    #block_global_array[i,vdofs] += local_array[:]
-                    #block_chunk[vdofs] += local_array[:]
-                    #print(vdofs, flush=True)
-                    #block_global_array[i,np.array([1,5,6])] += 1
-
-                    block_global_array[i][np.array([1,5,6])] += 1
+                    block_global_array[i,vdofs] += local_array[:]
 
         # Barrier for the task space associated with the loop over blocks
         await ts 
 
+        #print("(Before sum) block global array = ", block_global_array[:,:10], "\n")
 
-    #print("(Before sum) block global array = ", block_global_array[:,:10], "\n")
-    print("(Before sum) block global array = ", [block_global_array[i][:10] for i in range(num_blocks)], "\n")
+        # Perform the reduction across the blocks and store in the globa_array
+        global_array = np.sum(block_global_array, axis=0)
 
-    # Perform the reduction across the blocks and store in the globa_array
-    #global_array = np.sum(block_global_array, axis=0)
-    global_array = np.sum(np.asarray(block_global_array), axis=0)
+        #print("(After sum) block global array = ", block_global_array[:,:10], "\n")
 
-    #print("(After sum) block global array = ", block_global_array[:,:10], "\n")
-    print("(After sum) block global array = ", [block_global_array[i][:10] for i in range(num_blocks)], "\n")
+        #print("global array = ", global_array[:10], "\n")
 
-    print("global array = ", global_array[:10], "\n")
+        # Define my own linear form for the RHS based on the above function
+        # The 'FormLinearSystem' method, which performs additional manipulations
+        # that simplify the RHS for the resulting linear system
+        my_b = mfem.LinearForm(fespace)
+        my_b.Assign(global_array)
 
-    # Define my own linear form for the RHS based on the above function
-    # The 'FormLinearSystem' method, which performs additional manipulations
-    # that simplify the RHS for the resulting linear system
-    my_b = mfem.LinearForm(fespace)
-    my_b.Assign(global_array)
+        # 7. Define the solution vector x as a finite element grid function
+        #   corresponding to fespace. Initialize x with initial guess of zero,
+        #   which satisfies the boundary conditions.
+        x = mfem.GridFunction(fespace)
+        x.Assign(0.0)
 
-    # 7. Define the solution vector x as a finite element grid function
-    #   corresponding to fespace. Initialize x with initial guess of zero,
-    #   which satisfies the boundary conditions.
-    x = mfem.GridFunction(fespace)
-    x.Assign(0.0)
+        # 8. Set up the bilinear form a(.,.) on the finite element space
+        #   corresponding to the Laplacian operator -Delta, by adding the Diffusion
+        #   domain integrator.
+        a = mfem.BilinearForm(fespace)
+        if pa:
+            a.SetAssemblyLevel(mfem.AssemblyLevel_PARTIAL)
+        a.AddDomainIntegrator(mfem.DiffusionIntegrator(one))
 
-    # 8. Set up the bilinear form a(.,.) on the finite element space
-    #   corresponding to the Laplacian operator -Delta, by adding the Diffusion
-    #   domain integrator.
-    a = mfem.BilinearForm(fespace)
-    if pa:
-        a.SetAssemblyLevel(mfem.AssemblyLevel_PARTIAL)
-    a.AddDomainIntegrator(mfem.DiffusionIntegrator(one))
+        # 9. Assemble the bilinear form and the corresponding linear system,
+        #   applying any necessary transformations such as: eliminating boundary
+        #   conditions, applying conforming constraints for non-conforming AMR,
+        #   static condensation, etc.
+        if static_cond:
+            a.EnableStaticCondensation()
+        a.Assemble()
 
-    # 9. Assemble the bilinear form and the corresponding linear system,
-    #   applying any necessary transformations such as: eliminating boundary
-    #   conditions, applying conforming constraints for non-conforming AMR,
-    #   static condensation, etc.
-    if static_cond:
-        a.EnableStaticCondensation()
-    a.Assemble()
+        A = mfem.OperatorPtr()
+        B = mfem.Vector()
+        X = mfem.Vector()
 
-    A = mfem.OperatorPtr()
-    B = mfem.Vector()
-    X = mfem.Vector()
+        a.FormLinearSystem(ess_tdof_list, x, b, A, X, B)
+        print("Size of linear system: " + str(A.Height()),"\n")
 
-    a.FormLinearSystem(ess_tdof_list, x, b, A, X, B)
-    print("Size of linear system: " + str(A.Height()),"\n")
+        # Build the linear system with my linear form
+        my_B = mfem.Vector()
+        a.FormLinearSystem(ess_tdof_list, x, my_b, A, X, my_B)
 
-    # Build the linear system with my linear form
-    my_B = mfem.Vector()
-    a.FormLinearSystem(ess_tdof_list, x, my_b, A, X, my_B)
+        # Covert the MFEM Vectors to Numpy arrays for norms
+        B_array = B.GetDataArray()
+        my_B_array = my_B.GetDataArray()
 
-    # Covert the MFEM Vectors to Numpy arrays for norms
-    B_array = B.GetDataArray()
-    my_B_array = my_B.GetDataArray()
+        # Compare the output of the two RHS vectors
+        print("B =", B_array,"\n")
+        print("my_B =", my_B_array,"\n")
 
-    # Compare the output of the two RHS vectors
-    print("B =", B_array,"\n")
-    print("my_B =", my_B_array,"\n")
+        # Relative error against the MFEM output in the 2-norm
+        rel_err_1 = np.linalg.norm(my_B_array - B_array, 1)/np.linalg.norm(B_array, 1)
+        rel_err_2 = np.linalg.norm(my_B_array - B_array, 2)/np.linalg.norm(B_array, 2)
+        rel_err_inf = np.linalg.norm(my_B_array - B_array, np.inf)/np.linalg.norm(B_array, np.inf)
 
-    # Relative error against the MFEM output in the 2-norm
-    rel_err_1 = np.linalg.norm(my_B_array - B_array, 1)/np.linalg.norm(B_array, 1)
-    rel_err_2 = np.linalg.norm(my_B_array - B_array, 2)/np.linalg.norm(B_array, 2)
-    rel_err_inf = np.linalg.norm(my_B_array - B_array, np.inf)/np.linalg.norm(B_array, np.inf)
-
-    print("Relative error in the rhs (1-norm):", rel_err_1)
-    print("Relative error in the rhs (2-norm):", rel_err_2)
-    print("Relative error in the rhs (inf-norm):", rel_err_inf, "\n")
+        print("Relative error in the rhs (1-norm):", rel_err_1)
+        print("Relative error in the rhs (2-norm):", rel_err_2)
+        print("Relative error in the rhs (inf-norm):", rel_err_inf, "\n")
 
 
     # 10. Solve

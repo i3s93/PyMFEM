@@ -137,7 +137,9 @@ def run(order=1, static_cond=False,
     # To use the blocking scheme, we'll
     # also use another set of arrays that
     # hold partial sums of this global array
-    block_global_array = np.zeros([num_blocks, num_dof])
+    #block_global_array = np.zeros([num_blocks, num_dof])
+
+    block_global_array = [ np.zeros([num_dof]) for i in range(num_blocks) ]
 
     # Define the main task for parla
     @spawn(placement=cpu)
@@ -146,11 +148,6 @@ def run(order=1, static_cond=False,
         # Create the task space first
         ts = TaskSpace("LFTaskSpace")
 
-        # To use the blocking scheme, we'll
-        # also use another set of arrays that
-        # hold partial sums of this global array
-        block_global_array = np.zeros([num_blocks, num_dof])
-
         # Next we loop over each block which partitions the element indices
         # Each block will form a task, so we can control granularity by choosing
         # the number of blocks carefully. In most cases, this will be the number of
@@ -158,16 +155,20 @@ def run(order=1, static_cond=False,
         # round-robin style of mapping to devices
         for i in range(num_blocks):
 
-            @spawn(taskid=ts[i])
-            async def block_local_work():
+            # Try forcing sequential launching to ensure correctness 
+            deps = [ts[i-1]] if i > 0 else []
+
+            @spawn(taskid=ts[i], dependencies=deps)
+            def block_local_work():
 
                 # Need the offset for the element indices owned by this block
                 # This is the sum of all block sizes that came before it
                 s_idx = np.sum(block_sizes[:i])
                 e_idx = s_idx + block_sizes[i]
 
-                print("i = ", i)
-                print("s_idx = ", s_idx)
+                #print("i=",i,", s_idx=", s_idx, ", e_idx=", e_idx)
+
+                #block_chunk = block_global_array[i]
 
                 # Next, loop over the mesh elements on this block and perform quadrature evaluations
                 for j in range(s_idx, e_idx):
@@ -216,14 +217,28 @@ def run(order=1, static_cond=False,
                         local_array += wt*shape.GetDataArray()
 
                     # Accumulate the local array into the relevant entries of the block-wise global vector
-                    block_global_array[i,vdofs] += local_array[:]
+                    #block_global_array[i,vdofs] += local_array[:]
+                    #block_chunk[vdofs] += local_array[:]
+                    #print(vdofs, flush=True)
+                    #block_global_array[i,np.array([1,5,6])] += 1
 
-                #print("block_global_array = ", block_global_array, "\n")
+                    block_global_array[i][np.array([1,5,6])] += 1
 
         # Barrier for the task space associated with the loop over blocks
         await ts 
 
-    global_array = np.sum(block_global_array, axis=0)
+
+    #print("(Before sum) block global array = ", block_global_array[:,:10], "\n")
+    print("(Before sum) block global array = ", [block_global_array[i][:10] for i in range(num_blocks)], "\n")
+
+    # Perform the reduction across the blocks and store in the globa_array
+    #global_array = np.sum(block_global_array, axis=0)
+    global_array = np.sum(np.asarray(block_global_array), axis=0)
+
+    #print("(After sum) block global array = ", block_global_array[:,:10], "\n")
+    print("(After sum) block global array = ", [block_global_array[i][:10] for i in range(num_blocks)], "\n")
+
+    print("global array = ", global_array[:10], "\n")
 
     # Define my own linear form for the RHS based on the above function
     # The 'FormLinearSystem' method, which performs additional manipulations

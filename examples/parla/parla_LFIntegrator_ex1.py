@@ -32,6 +32,7 @@
 import os
 from os.path import expanduser, join
 import numpy as np
+import time
 
 # Import any of the MFEM Python modules
 import mfem.ser as mfem
@@ -101,43 +102,95 @@ def run(order=1, static_cond=False,
     # 6. Set up the linear form b(.) which corresponds to the right-hand side of
     #   the FEM linear system, which in this case is (1,phi_i) where phi_i are
     #   the basis functions in the finite element fespace.
+    pymfem_start = time.perf_counter()
+
     b = mfem.LinearForm(fespace)
     one = mfem.ConstantCoefficient(1.0)
     b.AddDomainIntegrator(mfem.DomainLFIntegrator(one))
     b.Assemble()
 
+    pymfem_end = time.perf_counter()
+
     #-----------------------------------------------------------------------------
     # Version based on Parla (naive approach)
     #-----------------------------------------------------------------------------
 
-    # Create a dictionary for MFEM objects to expand their scope
-    # This will gradually get larger as we'll add objects to it
-    #pymfem_obj = {"dim": dim, "order": order, "fespace": fespace}
-    
+    # Pre-processing step
+    # Get the quad information and store basis functions at the element quad pts
+    # Also need to store the local-to-global index mappings used in the scatter
+    intorder = 2*order # Order of the integration rule
+    num_elements = mesh.GetNE() # Number of mesh elements
+    gdof = fespace.GetNDofs() # Number of global dof
+    ldof = fespace.GetFE(0).GetDof() # Number of local dof
+    num_qp = mfem.IntRules.Get(fespace.GetFE(0).GetGeomType(), intorder).GetNPoints()
+
+    quad_wts = np.zeros([num_elements, num_qp]) # Quad weights
+    quad_pts = np.zeros([num_elements, num_qp, dim]) # Quad locations
+    shape_pts = np.zeros([num_elements, num_qp, ldof]) # Basis at quad locations
+    l2g_map = np.zeros([num_elements, ldof], dtype=np.int64) # Local-to-global index mappings
+
+    for i in range(num_elements):
+        
+        # Extract the element and the local-to-global indices (stored for later)
+        element = fespace.GetFE(i)
+        vdofs = np.asarray(fespace.GetElementVDofs(i))
+        l2g_map[i,:] = vdofs[:]
+
+        Tr = mesh.GetElementTransformation(i)
+        ir = mfem.IntRules.Get(element.GetGeomType(), intorder)
+        shape = mfem.Vector(np.zeros([ldof]))
+        
+        for j in range(ir.GetNPoints()):
+
+            # Get the integration point from the rule
+            ip = ir.IntPoint(j)
+
+            # Set an integration point in the element transformation
+            Tr.SetIntPoint(ip)
+
+            # Transform the reference integration point to a physical location
+            transip = mfem.Vector(np.zeros([dim]))
+            Tr.Transform(ip, transip)
+
+            # Next, evaluate all the basis functions at this integration point
+            element.CalcPhysShape(Tr, shape)
+
+            # Compute the adjusted quadrature weight (volume factors)
+            wt = ip.weight*Tr.Weight()
+
+            # Store the quadrature data for later
+            quad_wts[i,j] = wt
+            quad_pts[i,j,:] = transip.GetDataArray() 
+            shape_pts[i,j,:] = shape.GetDataArray()
+
+    print("Finished with pre-processing... Running Parla tasks\n")
+
+    #-----------------------------------------------------------------------------
+    # Partitioning elements into tasks
+    #-----------------------------------------------------------------------------
+
     # Specify a partition of the (global) list of elements
-    num_blocks = 4 # How many blocks do you want to use?! 
-    elements_per_block = mesh.GetNE()//num_blocks # Block size
-    leftover_blocks = mesh.GetNE() % num_blocks
+    num_blocks = 8 # How many blocks do you want to use?! 
+    elements_per_block = num_elements // num_blocks # Block size
+    leftover_blocks = num_elements % num_blocks
     
     # Adjust the number of elements if the block size doesn't divide the elements evenly
     block_sizes = elements_per_block*np.ones([num_blocks], dtype=np.int64)
     block_sizes[0:leftover_blocks] += 1
     
-    print("Number of blocks: " + str(num_blocks))
-    print("Number of left-over blocks: " + str(leftover_blocks))
-    print("Elements per block:", block_sizes,"\n")
-
-    # Set the number of DoF according to the FE space
-    num_dof = fespace.GetNDofs()
+    #print("Number of blocks: " + str(num_blocks))
+    #print("Number of left-over blocks: " + str(leftover_blocks))
+    #print("Elements per block:", block_sizes,"\n")
   
     # Create an array to hold the global data for the RHS
-    # This is just the linear form
-    global_array = np.zeros([num_dof])
+    global_array = np.zeros([gdof])
 
     # To use the blocking scheme, we'll
     # also use another set of arrays that
     # hold partial sums of this global array
-    block_global_array = np.zeros([num_blocks, num_dof])
+    block_global_array = np.zeros([num_blocks, gdof])
+
+    parla_start = time.perf_counter()
 
     # Define the main task for parla
     @spawn(placement=cpu)
@@ -164,63 +217,33 @@ def run(order=1, static_cond=False,
                 # Next, loop over the mesh elements on this block and perform quadrature evaluations
                 for j in range(s_idx, e_idx):
 
-                    #nonlocal pymfem_obj
-                    #fespace = pymfem_obj["fespace"]
-
-                    # Get the particular element
-                    element = fespace.GetFE(j)
-                    dof = element.GetDof()
+                    # Initialize the integral over the element
+                    local_array = np.zeros([ldof])
             
-                    # Get the indices for the DoF on this element
-                    # This tells us which entries we write to in the global array
-                    vdofs = fespace.GetElementVDofs(j)
-                    vdofs = np.asarray(vdofs) # Convert the list to a Numpy array
+                    for k in range(num_qp):
             
-                    # Get the element's transformation, which will maps the ir's reference points
-                    Tr = mesh.GetElementTransformation(j)
-                    intorder = 2*order
-                    ir = mfem.IntRules.Get(element.GetGeomType(), intorder)
-            
-                    # Storage for the basis functions and local dof on this element
-                    # This should always be smaller than the size of the global array
-                    shape = mfem.Vector(np.zeros([dof]))
-                    local_array = np.zeros([dof])
-            
-                    for k in range(ir.GetNPoints()):
-            
-                        # Get the integration point from the rule
-                        ip = ir.IntPoint(k)
-            
-                        # Set an integration point in the element transformation
-                        Tr.SetIntPoint(ip)
-            
-                        # Transform the reference integration point to a physical location
-                        transip = mfem.Vector(np.zeros([3]))
-                        Tr.Transform(ip, transip)
-            
-                        # Next, evaluate all the basis functions at this integration point
-                        element.CalcPhysShape(Tr, shape)
-            
-                        # Compute the adjusted quadrature weight (volume factors)
-                        wt = ip.weight*Tr.Weight()
-            
-                        # Store the contributions of the shape functions in the local array
-                        local_array += wt*shape.GetDataArray()
+                        ip = quad_pts[j,k,:] # Integration point from the rule
+                        shape = shape_pts[j,k,:] # Active basis functions at this integration point
+                        wt = quad_wts[j,k] # Quadrature weight
+                        local_array[:] += wt*shape[:] # Quadrature evaluation (with f = 1)
 
                     # Accumulate the local array into the relevant entries of the block-wise global vector
-                    block_global_array[i,vdofs] += local_array[:]
+                    block_global_array[i,l2g_map[j,:]] += local_array[:]
 
         # Barrier for the task space associated with the loop over blocks
         await ts 
 
-        #print("(Before sum) block global array = ", block_global_array[:,:10], "\n")
-
         # Perform the reduction across the blocks and store in the globa_array
         global_array = np.sum(block_global_array, axis=0)
 
-        #print("(After sum) block global array = ", block_global_array[:,:10], "\n")
+        parla_end = time.perf_counter()
 
-        #print("global array = ", global_array[:10], "\n")
+        print("PyMFEM time (s): ", pymfem_end - pymfem_start, "\n",flush=True)
+        print("Parla time (s): ", parla_end - parla_start, "\n",flush=True)
+
+        #-----------------------------------------------------------------------------
+        # End of the Parla test
+        #-----------------------------------------------------------------------------
 
         # Define my own linear form for the RHS based on the above function
         # The 'FormLinearSystem' method, which performs additional manipulations

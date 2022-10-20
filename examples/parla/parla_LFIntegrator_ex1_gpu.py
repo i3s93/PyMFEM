@@ -29,21 +29,79 @@
                  -Delta u = 1 with homogeneous Dirichlet boundary conditions.
 
 '''
+import argparse
 import os
 from os.path import expanduser, join
+
+# Parse the command line options
+parser = argparse.ArgumentParser(description='Ex1 (Laplace Problem)')
+parser.add_argument('-m', '--mesh',
+                    default='star.mesh',
+                    action='store', type=str,
+                    help='Mesh file to use.')
+parser.add_argument('-vis', '--visualization',
+                    action='store_true',
+                    help='Enable GLVis visualization')
+parser.add_argument('-o', '--order',
+                    action='store', default=1, type=int,
+                    help="Finite element order (polynomial degree) or -1 for isoparametric space.")
+parser.add_argument('-sc', '--static-condensation',
+                    action='store_true',
+                    help="Enable static condensation.")
+parser.add_argument("-pa", "--partial-assembly",
+                    action='store_true',
+                    help="Enable Partial Assembly.")
+parser.add_argument("-d", "--device",
+                    default="cpu", type=str,
+                    help="Device configuration string, see Device::Configure().")
+parser.add_argument('-ngpus', default=1, type=int, 
+                    help="How many gpus to use")
+
+args = parser.parse_args()
+#parser.print_options(args)
+print(args)
+
+order = args.order
+static_cond = args.static_condensation
+
+meshfile = expanduser(
+    join(os.path.dirname(__file__), '../../', 'data', args.mesh))
+
+visualization = args.visualization
+device = args.device
+ngpus = args.ngpus
+pa = args.partial_assembly
+
+# Specify information about the devices
+cuda_visible_devices = os.environ.get('CUDA_VISIBLE_DEVICES')
+
+if cuda_visible_devices is None:
+    print("CUDA_VISIBLE_DEVICES is not set. Assuming 0-3")
+    cuda_visible_devices = list(range(4))
+else:
+    cuda_visible_devices = cuda_visible_devices.strip().split(',')
+    cuda_visible_devices = list(map(int, cuda_visible_devices))
+
+gpus = cuda_visible_devices[:args.ngpus]
+os.environ['CUDA_VISIBLE_DEVICES'] = ','.join(map(str, gpus))
+
 import numpy as np
+import cupy as cp
 import numba as nb
+from numba import cuda
 import time
 
 # Import any of the MFEM Python modules
-import mfem.ser as mfem # Does this use OpenMP?
+import mfem.ser as mfem 
 from mfem.common.arg_parser import ArgParser
 
 # Parla modules and decorators
-from parla import Parla
-
-# Here we focus on cpu devices
+# These should be imported after "CUDA_VISIBLE_DEVICES" is set
+from parla import Parla, get_all_devices
 from parla.cpu import cpu
+from parla.cuda import gpu
+from parla.array import copy
+from parla.parray import asarray
 
 # Imports for the spawn decorator and TaskSpace declaration
 from parla.tasks import spawn, TaskSpace
@@ -51,9 +109,12 @@ from parla.tasks import spawn, TaskSpace
 # Check the hardware
 import psutil
 
-@nb.njit([nb.void(nb.float64[:], nb.int64[:,:], nb.float64[:,:], nb.float64[:,:,:],
-                  nb.float64[:,:,:], nb.int64, nb.int64)], 
-                  nogil=True, cache=False, boundscheck=False)
+
+#@cuda.jit([nb.void(nb.float64[:], nb.int64[:,:], nb.float64[:,:], nb.float64[:,:,:],
+#                  nb.float64[:,:,:], nb.int64, nb.int64)], 
+#                  nogil=True, cache=False, boundscheck=False)
+
+@nb.cuda.jit
 def inner_quad_kernel(bg_array, l2g_map, quad_wts, quad_pts, shape_pts, s_idx, e_idx):
     """
     Kernel that performs the quadrature evaluations over a collection of elements 
@@ -67,10 +128,12 @@ def inner_quad_kernel(bg_array, l2g_map, quad_wts, quad_pts, shape_pts, s_idx, e
     ldof = shape_pts.shape[2]
 
     # Initialize a local array to hold the integral over each element
-    local_array = np.zeros((ldof))
+    local_array = cp.zeros((ldof))
 
-    # Loop over the mesh elements on this block and perform quadrature evaluations
-    for j in range(s_idx, e_idx):
+    # Assign one thread to each element of the mesh
+    j = nb.cuda.grid(1) 
+
+    if j >= s_idx and j < e_idx:
 
         local_array[:] = 0.0
 
@@ -82,14 +145,17 @@ def inner_quad_kernel(bg_array, l2g_map, quad_wts, quad_pts, shape_pts, s_idx, e
             local_array[:] += wt*shape[:] # Quadrature evaluation (with f = 1)
 
         # Accumulate the local array into the relevant entries of the block-wise global array
-        bg_array[l2g_map[j,:]] += local_array[:]
+        # This needs to be done using atomics
+        for l in range(ldof):
+
+            nb.cuda.atomic.add(bg_array, l2g_map[j,l], local_array[j])
 
     return None
 
 
 def run(order=1, static_cond=False,
         meshfile='', visualization=False,
-        device='cpu', pa=False):
+        device='cpu', ngpus=ngpus, pa=False):
     '''
     run ex1
     '''
@@ -207,6 +273,12 @@ def run(order=1, static_cond=False,
 
     print("Finished with pre-processing... Running Parla tasks\n")
 
+    # Data transfer: Move the quadrature data to the current device
+    quad_wts_gpu = cp.asarray(quad_wts)
+    quad_pts_gpu = cp.asarray(quad_pts)
+    shape_pts_gpu = cp.asarray(shape_pts) 
+    l2g_map_gpu = cp.asarray(l2g_map) 
+
     #-----------------------------------------------------------------------------
     # Partitioning elements into tasks
     #-----------------------------------------------------------------------------
@@ -219,18 +291,23 @@ def run(order=1, static_cond=False,
     # Adjust the number of elements if the block size doesn't divide the elements evenly
     block_sizes = elements_per_block*np.ones([num_blocks], dtype=np.int64)
     block_sizes[0:leftover_blocks] += 1
-    
+
+    # Copy the block sizes to the device
+    block_sizes_gpu = cp.asarray(block_sizes)
+
     print("Number of blocks: " + str(num_blocks))
     print("Number of left-over blocks: " + str(leftover_blocks))
     print("Elements per block:", block_sizes,"\n")
   
     # Create an array to hold the global data for the RHS
+    # This will not be accessed on the device
     global_array = np.zeros([gdof])
 
     # To use the blocking scheme, we'll
     # also use another set of arrays that
     # hold partial sums of this global array
     block_global_array = np.zeros([num_blocks, gdof])
+    block_global_array_gpu = cp.zeros([num_blocks, gdof])
 
     parla_start = time.perf_counter()
 
@@ -242,34 +319,37 @@ def run(order=1, static_cond=False,
         ts = TaskSpace("LFTaskSpace")
 
         # Next we loop over each block which partitions the element indices
-        # Each block will form a task, so we can control granularity by choosing
-        # the number of blocks carefully. In most cases, this will be the number of
-        # devices. It may be possible to use more blocks than devices if we use a
-        # round-robin style of mapping to devices
         for i in range(num_blocks):
 
-            @spawn(taskid=ts[i], vcus=1/num_blocks)
+            @spawn(taskid=ts[i], placement=gpu[0])
             def block_local_work():
-
-                print("i=",i,"\n")
 
                 # Need the offset for the element indices owned by this block
                 # This is the sum of all block sizes that came before it
                 s_idx = np.sum(block_sizes[:i])
                 e_idx = s_idx + block_sizes[i]
 
+                threads_per_block = 256
+                blocks_per_grid = (block_sizes[i] + (threads_per_block - 1)) // threads_per_block
+
                 # Apply the Numba kernel to the block data
-                inner_quad_kernel(block_global_array[i,:], l2g_map, 
-                                  quad_wts, quad_pts, shape_pts, 
+                inner_quad_kernel[blocks_per_grid, threads_per_block](block_global_array_gpu[i,:], l2g_map_gpu, 
+                                  quad_wts_gpu, quad_pts_gpu, shape_pts_gpu, 
                                   s_idx, e_idx)
 
+                nb.cuda.synchronize()
+
         # Barrier for the task space associated with the loop over blocks
-        await ts 
+        await ts
 
         # Perform the reduction across the blocks and store in the global_array
-        global_array = np.sum(block_global_array, axis=0)
+        # This is done on the device
+        global_array_gpu = cp.sum(block_global_array_gpu, axis=0)
 
         parla_end = time.perf_counter()
+
+        # Transfer the global array back to the host
+        global_array = cp.asnumpy(global_array_gpu)
 
         print("PyMFEM time (s): ", pymfem_end - pymfem_start, "\n",flush=True)
         print("Parla time (s): ", parla_end - parla_start, "\n",flush=True)
@@ -365,39 +445,6 @@ def run(order=1, static_cond=False,
 
 if __name__ == "__main__":
 
-    parser = ArgParser(description='Ex1 (Laplace Problem)')
-    parser.add_argument('-m', '--mesh',
-                        default='star.mesh',
-                        action='store', type=str,
-                        help='Mesh file to use.')
-    parser.add_argument('-vis', '--visualization',
-                        action='store_true',
-                        help='Enable GLVis visualization')
-    parser.add_argument('-o', '--order',
-                        action='store', default=1, type=int,
-                        help="Finite element order (polynomial degree) or -1 for isoparametric space.")
-    parser.add_argument('-sc', '--static-condensation',
-                        action='store_true',
-                        help="Enable static condensation.")
-    parser.add_argument("-pa", "--partial-assembly",
-                        action='store_true',
-                        help="Enable Partial Assembly.")
-    parser.add_argument("-d", "--device",
-                        default="cpu", type=str,
-                        help="Device configuration string, see Device::Configure().")
-
-    args = parser.parse_args()
-    parser.print_options(args)
-
-    order = args.order
-    static_cond = args.static_condensation
-
-    meshfile = expanduser(
-        join(os.path.dirname(__file__), '../../', 'data', args.mesh))
-    visualization = args.visualization
-    device = args.device
-    pa = args.partial_assembly
-
     # First create the Parla context before spawning tasks
     with Parla():
 
@@ -406,6 +453,7 @@ if __name__ == "__main__":
             meshfile=meshfile,
             visualization=visualization,
             device=device,
+            ngpus=ngpus,
             pa=pa)
 
 
